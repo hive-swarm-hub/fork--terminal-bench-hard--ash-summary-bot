@@ -5,3 +5,4 @@ results.tsv
 jobs/
 .hive/
 .venv/
+run*.log
