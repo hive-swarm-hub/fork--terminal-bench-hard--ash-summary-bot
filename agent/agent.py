@@ -224,8 +224,8 @@ class AgentHarness(Terminus2):
     """
 
     # Adaptive thinking budget thresholds
-    _PLANNING_EPISODES = 0      # only episode 0 uses max reasoning
-    _PLANNING_EFFORT = "max"    # deep thinking for understanding + planning
+    _PLANNING_EPISODES = 0      # only episode 0 uses high reasoning
+    _PLANNING_EFFORT = "high"   # deep thinking for understanding + planning
     _EXECUTION_EFFORT = None    # use API default (don't override)
     _VERIFICATION_EFFORT = "high"  # careful check before completing
 
