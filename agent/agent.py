@@ -223,8 +223,8 @@ class AgentHarness(Terminus2):
     Instead of prompting the model to output JSON/XML and parsing it, TerminusKira uses the `tools` parameter in LLM API calls for structured outputs.
     """
 
-    # Adaptive thinking budget: only ep0 gets high reasoning (deep planning)
-    _PLANNING_EPISODES = 0      # only episode 0 uses high reasoning
+    # Adaptive thinking budget: eps 0-2 get high reasoning (planning + initial exploration)
+    _PLANNING_EPISODES = 2      # episodes 0-2 use high reasoning
     _PLANNING_EFFORT = "high"   # deep thinking for understanding + planning
 
     def __init__(self, *args, **kwargs):
