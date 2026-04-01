@@ -1,6 +1,9 @@
 #!/bin/bash
 
-cd /home/tianhao/terminal-bench-hard/agent
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+cd "$REPO_DIR/agent"
 
 harbor run \
   --agent-import-path agent:AgentHarness \
@@ -10,4 +13,4 @@ harbor run \
   -n 1 \
   --n-attempts 1 \
   -i fix-git \
-  --env-file /home/tianhao/terminal-bench-hard/.env
+  --env-file "$REPO_DIR/.env"

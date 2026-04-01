@@ -1,6 +1,9 @@
 #!/bin/bash
 
-cd /home/tianhao/terminal-bench-hard/agent
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+cd "$REPO_DIR/agent"
 
 harbor run \
   --agent-import-path agent:AgentHarness \
@@ -29,4 +32,4 @@ harbor run \
   -i extract-moves-from-video \
   -i make-mips-interpreter \
   -i model-extraction-relu-logits \
-  --env-file /home/tianhao/terminal-bench-hard/.env
+  --env-file "$REPO_DIR/.env"
