@@ -223,11 +223,9 @@ class AgentHarness(Terminus2):
     Instead of prompting the model to output JSON/XML and parsing it, TerminusKira uses the `tools` parameter in LLM API calls for structured outputs.
     """
 
-    # Adaptive thinking budget thresholds
+    # Adaptive thinking budget: only ep0 gets high reasoning (deep planning)
     _PLANNING_EPISODES = 0      # only episode 0 uses high reasoning
     _PLANNING_EFFORT = "high"   # deep thinking for understanding + planning
-    _EXECUTION_EFFORT = None    # use API default (don't override)
-    _VERIFICATION_EFFORT = "high"  # careful check before completing
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -683,17 +681,10 @@ class AgentHarness(Terminus2):
         if hasattr(self._llm, "_api_base") and self._llm._api_base:
             completion_kwargs["api_base"] = self._llm._api_base
 
-        # Adaptive thinking budget: max for planning, default for execution, high for verification
+        # Adaptive thinking: high reasoning for ep0 (deep planning), then default
         if self._current_episode <= self._PLANNING_EPISODES:
-            effort = self._PLANNING_EFFORT
-        elif self._pending_completion:
-            effort = self._VERIFICATION_EFFORT
-        else:
-            effort = self._EXECUTION_EFFORT
-
-        if effort is not None:
-            completion_kwargs["reasoning_effort"] = effort
-            completion_kwargs["temperature"] = 1
+            completion_kwargs["reasoning_effort"] = self._PLANNING_EFFORT
+            completion_kwargs["temperature"] = 1  # required by API when reasoning_effort is set
 
         try:
             response = await litellm.acompletion(**completion_kwargs)
