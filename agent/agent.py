@@ -59,6 +59,7 @@ BLOCK_TIMEOUT_SEC = 600  # 10 minutes
 _MARKER_PREFIX = "__CMDEND__"  # Marker prefix for command completion detection
 
 
+
 @dataclass
 class ToolCallResponse:
     """Extended response that includes tool calls."""
@@ -222,10 +223,16 @@ class AgentHarness(Terminus2):
     Instead of prompting the model to output JSON/XML and parsing it, TerminusKira uses the `tools` parameter in LLM API calls for structured outputs.
     """
 
+    # Adaptive thinking budget thresholds
+    _PLANNING_EPISODES = 2      # episodes 0..N use high reasoning
+    _HIGH_EFFORT = "high"
+    _LOW_EFFORT = "low"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._marker_seq = 0
         self._total_time_saved = 0.0
+        self._current_episode = 0
 
     async def _with_block_timeout(self, coro, timeout_sec: int = BLOCK_TIMEOUT_SEC):
         """Wrap coroutine with block detection timeout."""
@@ -239,53 +246,102 @@ class AgentHarness(Terminus2):
         commands: list[Command],
         session: TmuxSession,
     ) -> tuple[bool, str]:
-        """Execute commands with marker-based polling for early completion detection.
+        """Hybrid command execution: fast-path sleep or pipelined marker polling.
 
-        Sends a unique echo marker after each command. If the marker appears in
-        the output before duration_sec, we move on immediately instead of waiting
-        for the full duration. This reduces unnecessary wait time for fast commands.
+        For fast batches (max single duration <= 0.5s): sends all keystrokes then
+        sleeps briefly — avoids the ~0.5s per-poll round-trip overhead that
+        dominates when commands are instant.
+
+        For slow batches: sends all keystrokes + echo markers upfront, then polls
+        only for the LAST marker with capture_entire=True.  Up to 5x faster than
+        sleeping the full declared duration.
         """
+        if not commands:
+            output = await session.get_incremental_output()
+            return False, self._limit_output_length(output)
+
+        total_duration = sum(c.duration_sec for c in commands)
+        max_duration = max(c.duration_sec for c in commands)
+
+        # ---- Fast path: all commands are quick, skip marker overhead ----
+        if max_duration <= 0.5:
+            for command in commands:
+                await session.send_keys(
+                    command.keystrokes, block=False, min_timeout_sec=0.0,
+                )
+            await asyncio.sleep(max(total_duration, 0.5))
+            output = await session.get_incremental_output()
+            return False, self._limit_output_length(output)
+
+        # ---- Slow path: pipelined markers ----
+        # Phase 1: fire all keystrokes + markers without waiting
+        batch_markers = []
         for command in commands:
             self._marker_seq += 1
             marker = f"{_MARKER_PREFIX}{self._marker_seq}__"
-            start = time.monotonic()
+            batch_markers.append(marker)
 
-            # Send the command
             await session.send_keys(
-                command.keystrokes,
-                block=False,
-                min_timeout_sec=0.0,
+                command.keystrokes, block=False, min_timeout_sec=0.0,
             )
-            # Send marker: will execute when shell returns after command
             await session.send_keys(
-                f"echo '{marker}'\n",
-                block=False,
-                min_timeout_sec=0.0,
+                f"echo '{marker}'\n", block=False, min_timeout_sec=0.0,
             )
 
-            # Poll for marker, exit early if found before duration
-            await asyncio.sleep(min(0.3, command.duration_sec))
-            while time.monotonic() - start < command.duration_sec:
-                pane_content = await session.capture_pane()
-                if marker in pane_content:
-                    break
-                await asyncio.sleep(0.5)
+        last_marker = batch_markers[-1]
+        hard_timeout = min(max(total_duration, 10.0), 120.0)
+        start = time.monotonic()
 
-            saved = command.duration_sec - (time.monotonic() - start)
-            if saved > 0.1:
-                self._total_time_saved += saved
-                self.logger.debug(
-                    f"[polling] saved {saved:.1f}s "
-                    f"(duration={command.duration_sec:.1f}s) "
-                    f"cmd={command.keystrokes!r}"
-                )
+        # Phase 2: poll for the last marker
+        await asyncio.sleep(min(0.3, total_duration))
+        found_last = False
+        while time.monotonic() - start < hard_timeout:
+            pane_content = await session.capture_pane(capture_entire=True)
+            if last_marker in pane_content:
+                found_last = True
+                break
+            await asyncio.sleep(0.5)
 
-        # Filter out marker lines from output so LLM sees clean output
+        elapsed = time.monotonic() - start
+        saved = total_duration - elapsed
+        if saved > 0.1:
+            self._total_time_saved += saved
+            self.logger.debug(
+                f"[hybrid] saved {saved:.1f}s "
+                f"(total_duration={total_duration:.1f}s, "
+                f"actual={elapsed:.1f}s, "
+                f"cmds={len(commands)})"
+            )
+
+        if not found_last:
+            pane_content = await session.capture_pane(capture_entire=True)
+            completed = sum(1 for m in batch_markers if m in pane_content)
+            self.logger.warning(
+                f"[stall] hard timeout {hard_timeout:.0f}s hit, "
+                f"{completed}/{len(commands)} commands completed"
+            )
+
+        # Phase 3: filter markers from output
         output = await session.get_incremental_output()
-        markers = {f"{_MARKER_PREFIX}{seq}__" for seq in range(1, self._marker_seq + 1)}
+        all_markers = {
+            f"{_MARKER_PREFIX}{seq}__"
+            for seq in range(1, self._marker_seq + 1)
+        }
         lines = output.split("\n")
-        lines = [line for line in lines if not any(m in line for m in markers)]
+        lines = [line for line in lines if not any(m in line for m in all_markers)]
         output = "\n".join(lines)
+
+        # If stall detected, append diagnostic info so the model knows
+        if not found_last:
+            stall_cmds = [c.keystrokes.strip()[:80] for c in commands[completed:]]
+            output += (
+                f"\n\n[WARNING: {len(commands) - completed} command(s) may not have "
+                f"completed within {hard_timeout:.0f}s. Possibly stalled commands: "
+                f"{'; '.join(stall_cmds)}. "
+                f"If a process is stuck, try: kill the process, use Ctrl+C, "
+                f"or run your next command with a fresh approach.]"
+            )
+
         return False, self._limit_output_length(output)
 
     @staticmethod
@@ -626,11 +682,13 @@ class AgentHarness(Terminus2):
         if hasattr(self._llm, "_api_base") and self._llm._api_base:
             completion_kwargs["api_base"] = self._llm._api_base
 
-        # Add reasoning effort if available
-        # When reasoning_effort is set, temperature MUST be 1 (API requirement)
-        if self._reasoning_effort:
-            completion_kwargs["reasoning_effort"] = self._reasoning_effort
-            completion_kwargs["temperature"] = 1
+        # Adaptive thinking budget: high for planning + verification, low for execution
+        if self._current_episode <= self._PLANNING_EPISODES or self._pending_completion:
+            effort = self._HIGH_EFFORT
+        else:
+            effort = self._LOW_EFFORT
+        completion_kwargs["reasoning_effort"] = effort
+        completion_kwargs["temperature"] = 1
 
         try:
             response = await litellm.acompletion(**completion_kwargs)
@@ -898,7 +956,14 @@ class AgentHarness(Terminus2):
             "(pip3 --version 2>&1 || echo 'pip3: not found') && "
             "(pip --version 2>&1 || echo 'pip: not found') && "
             "(apt-get --version 2>&1 | head -1 || echo 'apt-get: not found') && "
-            "echo '@@MEM@@' && free -h 2>/dev/null | head -2 || true"
+            "echo '@@MEM@@' && free -h 2>/dev/null | head -2 && "
+            # Read key task files (README, instructions) to give agent context
+            "echo '@@DOCS@@' && "
+            "for f in /app/README* /app/readme* /app/TASK* /app/task* /app/INSTRUCTIONS* /app/instructions* /app/*.md /app/*.txt; do "
+            "  if [ -f \"$f\" ] && [ $(wc -c < \"$f\") -lt 5000 ]; then "
+            "    echo \"--- $f ---\"; cat \"$f\"; echo; "
+            "  fi; "
+            "done 2>/dev/null || true"
         )
 
         try:
@@ -962,6 +1027,13 @@ class AgentHarness(Terminus2):
             mem = sections["MEM"].strip()
             if mem:
                 parts.append(f"Memory: {mem}")
+        if "DOCS" in sections:
+            docs = sections["DOCS"].strip()
+            if docs and len(docs) > 10:
+                # Limit to 4000 chars to avoid overwhelming the prompt
+                if len(docs) > 4000:
+                    docs = docs[:4000] + "\n... (truncated)"
+                parts.append(f"Task documentation found:\n{docs}")
 
         if not parts:
             return ""
@@ -982,6 +1054,17 @@ class AgentHarness(Terminus2):
         if self._session is None:
             raise RuntimeError("Session is not set. This should never happen.")
 
+        # Disable pagers globally to prevent the #1 agent failure mode
+        # (git log, man, etc. opening less which blocks the terminal)
+        try:
+            await self._session.send_keys(
+                "export PAGER=cat GIT_PAGER=cat MANPAGER=cat LESS='-F -X'\n",
+                block=False,
+                min_timeout_sec=0.3,
+            )
+        except Exception:
+            pass
+
         # Inject environment snapshot into the first prompt
         try:
             snapshot = await self._gather_env_snapshot()
@@ -998,6 +1081,7 @@ class AgentHarness(Terminus2):
         self._context.cost_usd = None
 
         for episode in range(self._max_episodes):
+            self._current_episode = episode
             self._n_episodes = episode + 1
             if not await self._with_block_timeout(self._session.is_session_alive()):
                 self.logger.debug("Session has ended, breaking out of agent loop")
