@@ -224,9 +224,10 @@ class AgentHarness(Terminus2):
     """
 
     # Adaptive thinking budget thresholds
-    _PLANNING_EPISODES = 2      # episodes 0..N use high reasoning
-    _HIGH_EFFORT = "high"
-    _LOW_EFFORT = "low"
+    _PLANNING_EPISODES = 0      # only episode 0 uses max reasoning
+    _PLANNING_EFFORT = "max"    # deep thinking for understanding + planning
+    _EXECUTION_EFFORT = None    # use API default (don't override)
+    _VERIFICATION_EFFORT = "high"  # careful check before completing
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -682,13 +683,17 @@ class AgentHarness(Terminus2):
         if hasattr(self._llm, "_api_base") and self._llm._api_base:
             completion_kwargs["api_base"] = self._llm._api_base
 
-        # Adaptive thinking budget: high for planning + verification, low for execution
-        if self._current_episode <= self._PLANNING_EPISODES or self._pending_completion:
-            effort = self._HIGH_EFFORT
+        # Adaptive thinking budget: max for planning, default for execution, high for verification
+        if self._current_episode <= self._PLANNING_EPISODES:
+            effort = self._PLANNING_EFFORT
+        elif self._pending_completion:
+            effort = self._VERIFICATION_EFFORT
         else:
-            effort = self._LOW_EFFORT
-        completion_kwargs["reasoning_effort"] = effort
-        completion_kwargs["temperature"] = 1
+            effort = self._EXECUTION_EFFORT
+
+        if effort is not None:
+            completion_kwargs["reasoning_effort"] = effort
+            completion_kwargs["temperature"] = 1
 
         try:
             response = await litellm.acompletion(**completion_kwargs)
