@@ -9,6 +9,3 @@ dependencies = [
     "litellm<1.82.7",
     "tenacity",
 ]
-
-[tool.setuptools]
-py-modules = ["agent", "anthropic_caching"]

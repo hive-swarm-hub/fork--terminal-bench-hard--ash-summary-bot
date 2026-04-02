@@ -8,7 +8,6 @@ and injects it into the initial prompt.
 
 import asyncio
 import json
-import shlex
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -184,16 +183,6 @@ TOOLS = [
                             "required": ["keystrokes"],
                         },
                     },
-                    "parallel": {
-                        "type": "boolean",
-                        "description": (
-                            "Set to true to run commands in parallel across separate terminal windows. "
-                            "Use this when commands are independent and don't depend on each other's output "
-                            "(e.g., installing packages while writing code, multiple independent file reads, "
-                            "running tests while editing other files). "
-                            "Default is false (sequential execution)."
-                        ),
-                    },
                 },
                 "required": ["analysis", "plan", "commands"],
             },
@@ -247,48 +236,6 @@ TOOLS = [
 ]
 
 
-class TmuxWindowPool:
-    """Pre-allocated pool of tmux windows for parallel execution and stall recovery."""
-
-    def __init__(self, environment, session_name: str, size: int = 4):
-        self._env = environment
-        self._sess = session_name
-        self._ready: list[str] = []
-        self._seq = 0
-        self._size = size
-
-    async def start(self):
-        """Pre-create the pool windows."""
-        for _ in range(self._size):
-            name = await self._create()
-            self._ready.append(name)
-
-    async def _create(self) -> str:
-        self._seq += 1
-        name = f"pool{self._seq}"
-        await self._env.exec(
-            command=f"tmux new-window -t {self._sess} -n {name} -d"
-        )
-        # Set PAGER=cat in the new window
-        await self._env.exec(
-            command=f"tmux send-keys -t {self._sess}:{name} 'export PAGER=cat GIT_PAGER=cat MANPAGER=cat' Enter"
-        )
-        return name
-
-    async def acquire(self) -> str:
-        """Get a ready window, creating one if pool is empty."""
-        if self._ready:
-            return self._ready.pop(0)
-        return await self._create()
-
-    async def release(self, name: str):
-        """Return a window to the pool after resetting it."""
-        target = f"{self._sess}:{name}"
-        await self._env.exec(command=f"tmux send-keys -t {target} C-c")
-        await self._env.exec(command=f"tmux send-keys -t {target} ' reset' Enter")
-        self._ready.append(name)
-
-
 class AgentHarness(Terminus2):
     """
     TerminusKira extends harbor's Terminus2 with native tool calling.
@@ -296,36 +243,50 @@ class AgentHarness(Terminus2):
     Instead of prompting the model to output JSON/XML and parsing it, TerminusKira uses the `tools` parameter in LLM API calls for structured outputs.
     """
 
-    _PLANNING_EPISODES = 1        # episodes 0-1 use high reasoning (plan + first feedback)
-    _PLANNING_EFFORT = "high"     # deep thinking for understanding + planning (NOT "max" — too slow)
-    _EXECUTION_EFFORT = None       # use API default (don't override)
-    _VERIFICATION_EFFORT = "high"  # careful check before completing
+    # Adaptive thinking: high reasoning for ep0 (deep planning), default for rest
+    _PLANNING_EPISODES = 0
+    _PLANNING_EFFORT = "high"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._marker_seq = 0
         self._total_time_saved = 0.0
-        self._window_pool: TmuxWindowPool | None = None
-        self._current_episode = 0
         self._consecutive_stalls = 0
+        self._current_episode = 0
 
     async def _reset_terminal(self, session: TmuxSession) -> str:
-        """Kill all processes and respawn a fresh bash shell."""
+        """Kill all processes and respawn a fresh bash shell in the tmux session.
+
+        Uses environment.exec() which bypasses the stuck tmux pane entirely,
+        so this works even when the terminal is completely unresponsive.
+        """
         env = session.environment
         session_name = session._session_name
 
+        # Step 1: Kill all user processes via environment.exec (bypasses tmux)
         try:
-            await env.exec(command="pkill -9 -u $(whoami) || true", user="root")
+            await asyncio.wait_for(
+                env.exec(command="pkill -9 -u $(whoami) || true", user="root"),
+                timeout=15,
+            )
         except Exception:
             pass
         await asyncio.sleep(0.5)
 
+        # Step 2: Kill the old tmux session
         try:
-            await env.exec(command=f"tmux kill-session -t {session_name} 2>/dev/null || true", user=session._user)
+            await asyncio.wait_for(
+                env.exec(
+                    command=f"tmux kill-session -t {session_name} 2>/dev/null || true",
+                    user=session._user,
+                ),
+                timeout=15,
+            )
         except Exception:
             pass
         await asyncio.sleep(0.5)
 
+        # Step 3: Start a fresh tmux session with the same name
         try:
             start_cmd = (
                 f"export TERM=xterm-256color && export SHELL=/bin/bash && "
@@ -334,29 +295,46 @@ class AgentHarness(Terminus2):
                 f"-d -s {session_name} 'bash --login'"
                 f'" /dev/null'
             )
-            await env.exec(command=start_cmd, user=session._user)
-        except Exception:
-            pass
+            result = await asyncio.wait_for(
+                env.exec(command=start_cmd, user=session._user),
+                timeout=15,
+            )
+            if result.return_code != 0:
+                self.logger.error(f"Failed to restart tmux session: {result.stderr}")
+        except Exception as e:
+            self.logger.error(f"Exception restarting tmux: {e}")
         await asyncio.sleep(0.5)
 
+        # Step 4: Re-disable pagers in the fresh shell
         try:
-            await session.send_keys("export PAGER=cat GIT_PAGER=cat MANPAGER=cat LESS='-F -X'\n", block=False, min_timeout_sec=0.3)
+            await session.send_keys(
+                "export PAGER=cat GIT_PAGER=cat MANPAGER=cat LESS='-F -X'\n",
+                block=False,
+                min_timeout_sec=0.3,
+            )
         except Exception:
             pass
 
+        # Step 5: cd back to /app (the standard working directory)
         try:
             await session.send_keys("cd /app\n", block=False, min_timeout_sec=0.3)
         except Exception:
             pass
 
+        # Wait for shell to be ready
+        await asyncio.sleep(1.0)
+
+        # Reset stall counter and buffer state
         self._consecutive_stalls = 0
         session._previous_buffer = None
 
+        # Capture the fresh terminal state
         try:
             output = await session.get_incremental_output()
         except Exception:
             output = "[Terminal reset complete. Fresh bash shell ready.]"
 
+        self.logger.info("Terminal reset completed successfully")
         return f"[TERMINAL RESET] All processes killed. Fresh bash shell ready in /app.\n\n{output}"
 
     async def _with_block_timeout(self, coro, timeout_sec: int = BLOCK_TIMEOUT_SEC):
@@ -366,28 +344,50 @@ class AgentHarness(Terminus2):
         except asyncio.TimeoutError:
             raise BlockError(f"Infrastructure API blocked for {timeout_sec}s")
 
+    @staticmethod
+    def _sanitize_command(keystrokes: str) -> str:
+        """Rewrite known-dangerous command patterns at infrastructure level.
+
+        This prevents terminal stalls without relying on the model following
+        prompt instructions (which V4 and V9 proved is unreliable).
+        """
+        import re
+        stripped = keystrokes.strip()
+        # tail -f → tail -100 (tail -f blocks terminal permanently)
+        if re.match(r'^tail\s+(-[nN]\s*\d+\s+)?-f\b', stripped):
+            keystrokes = re.sub(r'-f\b', '-100', keystrokes, count=1)
+        elif re.match(r'^tail\s+--follow\b', stripped):
+            keystrokes = keystrokes.replace('--follow', '-100', 1)
+        return keystrokes
+
     async def _execute_commands(
         self,
         commands: list[Command],
         session: TmuxSession,
     ) -> tuple[bool, str]:
-        """Execute commands — auto-parallelizes batches of 2+ commands across
-        separate tmux windows when a pool is available.
+        """Hybrid command execution: fast-path sleep or pipelined marker polling.
+
+        For fast batches (max single duration <= 0.5s): sends all keystrokes then
+        sleeps briefly — avoids the ~0.5s per-poll round-trip overhead that
+        dominates when commands are instant.
+
+        For slow batches: sends all keystrokes + echo markers upfront, then polls
+        only for the LAST marker with capture_entire=True.  Up to 5x faster than
+        sleeping the full declared duration.
         """
         if not commands:
             output = await session.get_incremental_output()
             return False, self._limit_output_length(output)
 
-        max_dur = max(c.duration_sec for c in commands)
-
-        # Auto-parallel: multiple commands with at least one slow command
-        if len(commands) >= 2 and max_dur > 5.0 and self._window_pool is not None:
-            return await self._execute_commands_parallel(commands, session)
+        # Sanitize dangerous commands before execution
+        for cmd in commands:
+            cmd.keystrokes = self._sanitize_command(cmd.keystrokes)
 
         total_duration = sum(c.duration_sec for c in commands)
+        max_duration = max(c.duration_sec for c in commands)
 
         # ---- Fast path: all commands are quick, skip marker overhead ----
-        if max_dur <= 0.5:
+        if max_duration <= 0.5:
             for command in commands:
                 await session.send_keys(
                     command.keystrokes, block=False, min_timeout_sec=0.0,
@@ -454,15 +454,17 @@ class AgentHarness(Terminus2):
         lines = [line for line in lines if not any(m in line for m in all_markers)]
         output = "\n".join(lines)
 
-        # If stall detected, append diagnostic info so the model knows
+        # Track consecutive stalls and suggest reset_terminal
         if not found_last:
             self._consecutive_stalls += 1
             stall_cmds = [c.keystrokes.strip()[:80] for c in commands[completed:]]
+
             if self._consecutive_stalls >= 3:
                 output += (
                     f"\n\n[CRITICAL: Terminal has been stuck for {self._consecutive_stalls} "
                     f"consecutive commands. Stalled on: {'; '.join(stall_cmds)}. "
-                    f"Call reset_terminal to kill all processes and get a fresh shell.]"
+                    f"Call reset_terminal to kill all processes and get a fresh shell. "
+                    f"Ctrl+C and kill commands are unlikely to work at this point.]"
                 )
             else:
                 output += (
@@ -474,136 +476,6 @@ class AgentHarness(Terminus2):
                 )
         else:
             self._consecutive_stalls = 0
-
-        return False, self._limit_output_length(output)
-
-    async def _execute_commands_parallel(
-        self,
-        commands: list[Command],
-        session: TmuxSession,
-    ) -> tuple[bool, str]:
-        """Execute commands in parallel across separate tmux windows.
-
-        Each command gets its own tmux window from the pool and runs simultaneously.
-        Results are collected concurrently with asyncio.gather.
-        """
-        if not commands:
-            output = await session.get_incremental_output()
-            return False, self._limit_output_length(output)
-
-        if self._window_pool is None:
-            # Fallback to sequential if pool not initialized
-            return await self._execute_commands(commands, session)
-
-        env = session.environment
-        sess_name = session._session_name
-
-        # Acquire windows for each command
-        window_assignments = []  # (cmd_index, command, window_name, marker)
-        for i, command in enumerate(commands):
-            if not command.keystrokes.strip():
-                # Empty commands just sleep
-                window_assignments.append((i, command, None, None))
-                continue
-            win_name = await self._window_pool.acquire()
-            self._marker_seq += 1
-            marker = f"{_MARKER_PREFIX}{self._marker_seq}__"
-            window_assignments.append((i, command, win_name, marker))
-
-        # Fire all commands simultaneously
-        for i, command, win_name, marker in window_assignments:
-            if win_name is None:
-                continue
-            target = f"{sess_name}:{win_name}"
-            await env.exec(
-                command=f"tmux send-keys -t {target} {shlex.quote(command.keystrokes)}"
-            )
-            await env.exec(
-                command=f"tmux send-keys -t {target} {shlex.quote(f'echo {marker}' + chr(10))}"
-            )
-
-        # Poll all windows concurrently
-        async def poll_window(cmd_idx, command, win_name, marker):
-            target = f"{sess_name}:{win_name}"
-            deadline = time.monotonic() + min(command.duration_sec + 3.0, 63.0)
-            await asyncio.sleep(min(0.3, command.duration_sec))
-
-            prev_pane = ""
-            unchanged_polls = 0
-
-            while time.monotonic() < deadline:
-                result = await env.exec(
-                    command=f"tmux capture-pane -p -S - -t {target}"
-                )
-                pane = result.stdout or ""
-
-                if marker in pane:
-                    # Release window back to pool
-                    await self._window_pool.release(win_name)
-                    saved = command.duration_sec - (time.monotonic() - (deadline - command.duration_sec - 3.0))
-                    if saved > 0.1:
-                        self._total_time_saved += saved
-                    return cmd_idx, pane, False
-
-                # Stall detection
-                if pane == prev_pane:
-                    unchanged_polls += 1
-                else:
-                    unchanged_polls = 0
-                prev_pane = pane
-
-                if unchanged_polls >= 6:  # 3s of no change
-                    break
-
-                await asyncio.sleep(0.5)
-
-            # Stalled or timed out — capture what we have
-            result = await env.exec(
-                command=f"tmux capture-pane -p -S - -t {target}"
-            )
-            # Kill and replace the stalled window
-            await self._window_pool.release(win_name)
-            return cmd_idx, (result.stdout or "") + f"\n[STALL: command timed out after {command.duration_sec}s]", True
-
-        # Gather results concurrently
-        poll_tasks = []
-        for i, command, win_name, marker in window_assignments:
-            if win_name is not None:
-                poll_tasks.append(poll_window(i, command, win_name, marker))
-
-        if poll_tasks:
-            results = await asyncio.gather(*poll_tasks)
-        else:
-            results = []
-
-        # Handle empty waits
-        for i, command, win_name, marker in window_assignments:
-            if win_name is None:
-                await asyncio.sleep(min(command.duration_sec, 2.0))
-
-        # Build ordered output
-        result_by_idx = {idx: (out, stalled) for idx, out, stalled in results}
-        output_parts = []
-        for i, command, win_name, marker in window_assignments:
-            if win_name is None:
-                continue  # skip empty waits in output
-            out, stalled = result_by_idx.get(i, ("", False))
-            output_parts.append(out)
-
-        # Also get any output from the main session
-        try:
-            main_output = await session.get_incremental_output()
-            if main_output.strip():
-                output_parts.append(main_output)
-        except Exception:
-            pass
-
-        # Clean markers from output
-        combined = "\n".join(output_parts)
-        markers = {f"{_MARKER_PREFIX}{seq}__" for seq in range(1, self._marker_seq + 1)}
-        lines = combined.split("\n")
-        lines = [line for line in lines if not any(m in line for m in markers)]
-        output = "\n".join(lines)
 
         return False, self._limit_output_length(output)
 
@@ -696,11 +568,11 @@ class AgentHarness(Terminus2):
 
     def _parse_tool_calls(
         self, tool_calls: list[dict[str, Any]]
-    ) -> tuple[list[Command], bool, str, str, str, ImageReadRequest | None, bool, bool]:
+    ) -> tuple[list[Command], bool, str, str, str, ImageReadRequest | None, bool]:
         """Parse tool calls into commands.
 
         Returns:
-            Tuple of (commands, is_task_complete, feedback, analysis, plan, image_read, parallel, reset_terminal)
+            Tuple of (commands, is_task_complete, feedback, analysis, plan, image_read, reset_terminal)
         """
         commands = []
         is_task_complete = False
@@ -708,7 +580,6 @@ class AgentHarness(Terminus2):
         analysis = ""
         plan = ""
         image_read = None
-        parallel = False
         reset_terminal = False
 
         if not tool_calls:
@@ -716,7 +587,7 @@ class AgentHarness(Terminus2):
                 "WARNINGS: Your response contained no tool calls. "
                 "Please use execute_commands to run commands."
             )
-            return commands, is_task_complete, feedback, analysis, plan, image_read, parallel, reset_terminal
+            return commands, is_task_complete, feedback, analysis, plan, image_read, reset_terminal
 
         for tool_call in tool_calls:
             function_name = tool_call.get("function", {}).get("name", "")
@@ -735,7 +606,6 @@ class AgentHarness(Terminus2):
                 # Extract analysis and plan
                 analysis = arguments.get("analysis", "")
                 plan = arguments.get("plan", "")
-                parallel = arguments.get("parallel", False)
 
                 # Extract commands array (Haiku sometimes double-encodes as a JSON string)
                 cmds = arguments.get("commands", [])
@@ -780,7 +650,7 @@ class AgentHarness(Terminus2):
                 )
                 self.logger.warning(f"Unknown function called: {function_name}")
 
-        return commands, is_task_complete, feedback, analysis, plan, image_read, parallel, reset_terminal
+        return commands, is_task_complete, feedback, analysis, plan, image_read, reset_terminal
 
     @retry(
         stop=stop_after_attempt(5),
@@ -950,16 +820,12 @@ class AgentHarness(Terminus2):
         if hasattr(self._llm, "_api_base") and self._llm._api_base:
             completion_kwargs["api_base"] = self._llm._api_base
 
-        # Adaptive thinking: high for planning, default for execution, high for verification
+        # Adaptive thinking: high reasoning for planning episodes, default for rest
         if self._current_episode <= self._PLANNING_EPISODES:
-            effort = self._PLANNING_EFFORT
-        elif self._pending_completion:
-            effort = self._VERIFICATION_EFFORT
-        else:
-            effort = self._EXECUTION_EFFORT
-
-        if effort is not None:
-            completion_kwargs["reasoning_effort"] = effort
+            completion_kwargs["reasoning_effort"] = self._PLANNING_EFFORT
+            completion_kwargs["temperature"] = 1
+        elif self._reasoning_effort:
+            completion_kwargs["reasoning_effort"] = self._reasoning_effort
             completion_kwargs["temperature"] = 1
 
         try:
@@ -1001,7 +867,7 @@ class AgentHarness(Terminus2):
         original_instruction: str = "",
         session: TmuxSession | None = None,
     ) -> tuple[
-        list[Command], bool, str, str, str, LLMResponse, ImageReadRequest | None, bool, bool
+        list[Command], bool, str, str, str, LLMResponse, ImageReadRequest | None, bool
     ]:
         """Handle LLM interaction using native tool calling.
 
@@ -1179,7 +1045,7 @@ class AgentHarness(Terminus2):
             response_path.write_text(response_text)
 
         # Parse tool calls into commands
-        commands, is_task_complete, feedback, analysis, plan, image_read, parallel, reset_terminal = (
+        commands, is_task_complete, feedback, analysis, plan, image_read, reset_terminal = (
             self._parse_tool_calls(tool_response.tool_calls)
         )
 
@@ -1198,7 +1064,6 @@ class AgentHarness(Terminus2):
             plan,
             llm_response,
             image_read,
-            parallel,
             reset_terminal,
         )
 
@@ -1347,17 +1212,6 @@ class AgentHarness(Terminus2):
         except Exception:
             pass  # Silent failure — don't break the agent
 
-        # Initialize window pool for automatic parallel execution
-        try:
-            self._window_pool = TmuxWindowPool(
-                self._session.environment,
-                self._session._session_name,
-                size=4,
-            )
-            await self._window_pool.start()
-        except Exception:
-            self._window_pool = None
-
         prompt = initial_prompt
 
         self._context.n_input_tokens = 0
@@ -1401,7 +1255,6 @@ class AgentHarness(Terminus2):
                 plan,
                 llm_response,
                 image_read,
-                parallel,
                 reset_terminal,
             ) = await self._handle_llm_interaction(
                 chat, prompt, logging_paths, original_instruction, self._session
@@ -1499,35 +1352,59 @@ class AgentHarness(Terminus2):
                 continue
 
             if reset_terminal:
+                # Terminal reset path — kill everything and get a fresh shell
                 self.logger.info("Agent requested terminal reset")
-                reset_output = await self._with_block_timeout(
-                    self._reset_terminal(self._session)
-                )
-                observation = reset_output
-                # Record trajectory step
+                try:
+                    reset_output = await asyncio.wait_for(
+                        self._reset_terminal(self._session),
+                        timeout=60,  # 60s should be plenty for a reset
+                    )
+                    observation = reset_output
+                except (asyncio.TimeoutError, Exception) as e:
+                    self.logger.error(f"Terminal reset failed: {e}")
+                    self._consecutive_stalls = 0
+                    observation = (
+                        f"[TERMINAL RESET FAILED: {e}. "
+                        f"The terminal may still be stuck. Try running commands normally — "
+                        f"the session may have partially recovered.]"
+                    )
+
                 cache_tokens_used = chat.total_cache_tokens - tokens_before_cache
                 step_cost = chat.total_cost - cost_before
-                tool_calls_list = [ToolCall(
-                    tool_call_id=f"call_{episode}_reset",
-                    function_name="reset_terminal",
-                    arguments={},
-                )]
-                self._trajectory_steps.append(Step(
-                    step_id=len(self._trajectory_steps) + 1,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    source="agent",
-                    model_name=self._model_name,
-                    message=message_content,
-                    reasoning_content=llm_response.reasoning_content,
-                    tool_calls=tool_calls_list,
-                    observation=Observation(results=[ObservationResult(content=observation)]),
-                    metrics=Metrics(
-                        prompt_tokens=chat.total_input_tokens - tokens_before_input,
-                        completion_tokens=chat.total_output_tokens - tokens_before_output,
-                        cached_tokens=cache_tokens_used if cache_tokens_used > 0 else None,
-                        cost_usd=step_cost if step_cost > 0 else None,
-                    ),
-                ))
+
+                tool_calls_list: list[ToolCall] = [
+                    ToolCall(
+                        tool_call_id=f"call_{episode}_reset",
+                        function_name="reset_terminal",
+                        arguments={},
+                    )
+                ]
+                self._trajectory_steps.append(
+                    Step(
+                        step_id=len(self._trajectory_steps) + 1,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        source="agent",
+                        model_name=self._model_name,
+                        message=message_content,
+                        reasoning_content=llm_response.reasoning_content,
+                        tool_calls=tool_calls_list,
+                        observation=Observation(
+                            results=[ObservationResult(content=observation)]
+                        ),
+                        metrics=Metrics(
+                            prompt_tokens=chat.total_input_tokens - tokens_before_input,
+                            completion_tokens=chat.total_output_tokens
+                            - tokens_before_output,
+                            cached_tokens=cache_tokens_used
+                            if cache_tokens_used > 0
+                            else None,
+                            cost_usd=step_cost if step_cost > 0 else None,
+                            prompt_token_ids=llm_response.prompt_token_ids,
+                            completion_token_ids=llm_response.completion_token_ids,
+                            logprobs=llm_response.logprobs,
+                        ),
+                    )
+                )
                 self._dump_trajectory()
                 prompt = observation
             elif image_read is not None:
@@ -1619,20 +1496,12 @@ class AgentHarness(Terminus2):
                 prompt = observation
             else:
                 # Commands path (existing behavior)
-                if parallel and len(commands) > 1:
-                    timeout_occurred, terminal_output = await self._with_block_timeout(
-                        self._execute_commands_parallel(
-                            commands,
-                            self._session,
-                        )
+                timeout_occurred, terminal_output = await self._with_block_timeout(
+                    self._execute_commands(
+                        commands,
+                        self._session,
                     )
-                else:
-                    timeout_occurred, terminal_output = await self._with_block_timeout(
-                        self._execute_commands(
-                            commands,
-                            self._session,
-                        )
-                    )
+                )
 
                 was_pending_completion = self._pending_completion
 

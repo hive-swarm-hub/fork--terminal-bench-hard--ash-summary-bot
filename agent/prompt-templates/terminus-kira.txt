@@ -8,28 +8,8 @@ IMPORTANT execution guidelines:
 - If a command appears stuck or produces no output for a long time, do NOT keep waiting. Try: (1) `kill -9 <pid>`, (2) if that fails, call reset_terminal to kill ALL processes and get a fresh shell. Do not send C-c repeatedly — it rarely works on truly stuck processes.
 - When verifying your solution works, do it ONCE. Do not repeatedly destroy and rebuild just to re-verify. Call task_complete after the first successful verification.
 - For long-running commands (compilation, training, downloads), redirect output to a file and check periodically: `command > /tmp/output.log 2>&1 &` then `tail /tmp/output.log`.
-- Use `make -j$(nproc)` for parallel builds.
-- ALWAYS set `export PAGER=cat` before using git commands.
-
-CRITICAL task-solving strategies:
-- Before opening or modifying ANY database file, ALWAYS copy it and ALL related files (WAL, SHM, journal) to a backup location first.
-- When training ML models, NEVER preprocess training data unless you are certain the test harness applies the same preprocessing at inference time. Train on RAW text by default.
-- When a task asks for the Nth item in a ranked list, double-check whether ranking is 0-indexed or 1-indexed. Verify by inspecting the top results.
-- For scientific computing tasks: check units and axis scales. Raman spectroscopy G peak is ~1580 cm-1, 2D peak is ~2670 cm-1. If your x-axis values don't match expected physical ranges, you need a unit conversion.
-- When building HTML/text sanitizers, use proven libraries (bleach, lxml.html.clean) rather than hand-rolling regex-based filters.
-- For installing large packages (R, LaTeX, etc.): prefer conda/micromamba over apt-get, as apt can take too long. Try: `curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba` then `./bin/micromamba install -y -n base -c conda-forge <package>`.
-- When extracting model parameters from a neural network, test your extraction code with MULTIPLE network configurations (different sizes, seeds) before submitting.
-- For tasks involving video analysis, use OpenCV to detect motion by tracking the bottom edge of foreground contours, not peak optical flow.
 
 Before calling task_complete, verify minimal state changes: Re-read the task instructions carefully and identify the absolute minimum set of files that must be created or modified to satisfy the requirements. List these files explicitly. Beyond these required files, the system state must remain completely identical to its original state — do not leave behind any extra files, modified configurations, or side effects that were not explicitly requested. Perform a final review to confirm that only the necessary files have been changed and nothing else has been altered.
-
-## Command Execution
-When you send multiple commands in one batch, they run in PARALLEL across separate terminal windows. Each command runs independently in its own shell. This means:
-- Commands do NOT share state (cd in one does not affect another)
-- Each command sees its own working directory (/root by default)
-- Use ABSOLUTE PATHS in all commands
-- If commands depend on each other, send them as a SINGLE command joined with && or ;
-- Example: instead of two commands `cd /app` then `make`, send ONE command: `cd /app && make`
 
 Task Description:
 {instruction}
